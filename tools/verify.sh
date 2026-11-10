@@ -766,10 +766,29 @@ if [ $HAS_IR -eq 1 ]; then
       DEV=$(sed -n 's/^device_path[[:space:]]*=[[:space:]]*//p' "$CFG" | head -1)
       if [ -z "$DEV" ]; then
         next "set device_path in $CFG — run $ROOT/tools/find-ir-node.sh to get the right /dev/videoN"
+      elif [ "$DEV" = none ]; then
+        sub "device_path is 'none', so Howdy cannot open a camera at all"
+        sub "the boot-time hook writes 'none' when it cannot resolve the IR node,"
+        sub "rather than leave a path that may now be the RGB camera"
+        next "face unlock is OFF (device_path = none). Fix the IR node first, then: sudo systemctl start howdy-ir-device-path.service"
       elif [ -n "$LD_NODE" ] && [ "$DEV" != "$LD_NODE" ]; then
         sub "config says $DEV, the media graph says the IR node is $LD_NODE"
         sub "node numbers shuffle between boots, so this may simply be stale"
-        next "device_path in $CFG is $DEV but the IR capture node is currently $LD_NODE"
+        next "device_path in $CFG is $DEV but the IR capture node is currently $LD_NODE — 'sudo systemctl start howdy-ir-device-path.service' sets it, or run $ROOT/scripts/howdy-ir-device-path.sh"
+      fi
+      # The hook that keeps device_path true. Missing is not BROKEN -- a
+      # hand-set path works until the next reboot -- but it is the whole
+      # difference between "face unlock works" and "face unlock worked".
+      if [ -f /etc/systemd/system/howdy-ir-device-path.service ]; then
+        if have systemctl && systemctl is-enabled howdy-ir-device-path.service >/dev/null 2>&1; then
+          p "  device_path hook" "enabled (resolves the IR node every boot)"
+        else
+          p "  device_path hook" "installed but NOT enabled"
+          next "run 'sudo systemctl enable howdy-ir-device-path.service' — without it device_path goes stale at the next reboot"
+        fi
+      else
+        p "  device_path hook" "not installed"
+        next "install the boot-time device_path hook so face unlock survives a reboot: sudo $ROOT/install.sh --howdy-only"
       fi
     fi
   fi

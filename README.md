@@ -937,13 +937,93 @@ Gotchas that cost real debugging time:
   fails *silently* and yields convincing fake negatives. Always confirm the
   kernel's `config phy N ... mbps M` line actually changed.
 * `/dev/videoN`, `/dev/v4l-subdevN` and libcamera indexes **shuffle between
-  boots**. Resolve by entity name (`tools/find-ir-node.sh`), never hardcode.
+  boots**. Resolve by entity name (`tools/find-ir-node.sh`), never hardcode —
+  which is why `device_path` is now resolved on every boot rather than written
+  once (see below).
 * Howdy's `dark_threshold` is **not brightness** — it is the percentage of
   near-black pixels, and a frame is rejected when it *exceeds* the threshold.
   IR frames here are ~70-77% black, so the stock `60` rejects everything. Use 90.
 * Howdy's recognition runs as the **unprivileged user** under a lock screen, so
   the illuminator needs `udev/99-hm1092-ir-led.rules` or it silently never fires
   and every frame is too dark to detect a face.
+
+#### Keeping `device_path` true — `howdy-ir-device-path.service`
+
+Howdy stores one literal `device_path`, and IPU7 capture nodes are numbered in
+bind order, so the value that worked today is a guess tomorrow. The installer
+used to print *"set `device_path` to your IR node"* and leave it to you. That is
+a standing trap, and the second way it fails is the one that matters:
+
+1. the path names nothing, or an unrelated node, and face unlock just stops
+   working; or
+2. the path names a **working RGB capture node**. The HM1092 failing to bind
+   while the OV05C10 binds is a normal failure on this hardware — and then face
+   recognition is running on a *visible-light* camera that a photograph
+   defeats, wired in as `auth sufficient pam_howdy.so`.
+
+So `install.sh` now deploys `scripts/howdy-ir-device-path.sh` to
+`/usr/local/lib/svp7500-camera/` (with its copy of `tools/lib-detect.sh`) and
+enables a oneshot unit that runs before `systemd-user-sessions.service` and
+before every common display manager. It follows the `hm1092` entity's own links
+through the media graph — it never knows a port or a node number — and writes
+the result into whichever `config.ini` your Howdy packaging uses.
+
+**It fails closed.** If the IR capture node cannot be resolved, `device_path` is
+set to `none`: Howdy then reports *"not possible to open camera at configured
+path"*, PAM falls through to your password, and nothing authenticates off the
+RGB sensor. The unit goes red in `systemctl --failed` and the journal says why,
+because "face unlock is off tonight" is something you want to be told.
+
+```bash
+systemctl status howdy-ir-device-path     # what it resolved on this boot
+journalctl -u howdy-ir-device-path -b     # old -> new, with the entity chain
+
+# by hand, any time (after a module reload, say):
+sudo systemctl start howdy-ir-device-path
+sudo /usr/local/lib/svp7500-camera/howdy-ir-device-path.sh --dry-run   # verdict only
+```
+
+`--keep-stale` opts out of failing closed and leaves whatever is in the file.
+`--wait N` (default 10) bounds how long boot waits for the media graph; the full
+wait only elapses when the sensor never bound. `tools/verify.sh` reports whether
+the unit is installed and enabled, and flags a `device_path` that disagrees with
+the media graph.
+
+#### Wiring Howdy into PAM
+
+The pack installs the recorder, the illuminator rule and the hook above; it does
+**not** edit your PAM stack, because which services should accept a face is your
+decision. The lines are `auth sufficient pam_howdy.so`, placed **first** in each
+service you want it in:
+
+| file | what it covers |
+|---|---|
+| `/etc/pam.d/sudo` | `sudo` |
+| `/etc/pam.d/plasmalogin` | the Plasma login manager (Plasma 6.5+; older setups use `/etc/pam.d/sddm`) |
+| `/etc/pam.d/kde` | the Plasma screen locker |
+| `/etc/pam.d/login` | **console/TTY login** (`agetty`) |
+
+Two things to get right:
+
+* `/etc/pam.d/login` starts with `auth requisite pam_nologin.so`. Put the Howdy
+  line **after** it, not at the top: a `sufficient` module that succeeds skips
+  the rest of the `auth` stack, so a face match above `pam_nologin` would also
+  skip the `/etc/nologin` check.
+
+  ```bash
+  sudo sed -i '/^auth[[:space:]]\+include[[:space:]]\+system-local-login/i auth\t\tsufficient\tpam_howdy.so' /etc/pam.d/login
+  ```
+
+* `plasmalogin` and `kde` ship in `/usr/lib/pam.d/`, not `/etc/pam.d/`. Copying
+  them into `/etc/pam.d/` to add the line (which is what you have to do) makes a
+  permanent override: later package updates to the vendor file are silently
+  ignored, and there is no `.pacnew` to warn you. Re-diff them against
+  `/usr/lib/pam.d/` after a Plasma upgrade. `/etc/pam.d/login` belongs to
+  `util-linux`, so that one *does* get a `.pacnew`.
+
+Leave `abort_if_ssh = true` in `config.ini` alone: it is what keeps a remote
+shell from being let in by a camera nobody is sitting in front of. SSH's own
+PAM service is untouched either way.
 
 ## License
 

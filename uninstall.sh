@@ -11,6 +11,11 @@
 #     ov05c10, int3472-patched
 #   - /etc/udev/rules.d/99-hm1092-ir-led.rules
 #   - /etc/udev/rules.d/99-svp7500-no-autosuspend.rules
+#   - the boot-time Howdy device_path hook: howdy-ir-device-path.service and
+#     /usr/local/lib/svp7500-camera/. Howdy's own config is left as it is, so
+#     whatever device_path it holds at that point stays -- and node numbers
+#     shuffle between boots, so set it by hand (tools/find-ir-node.sh) or
+#     expect face unlock to stop working after the next reboot
 #   - the three wireplumber drop-ins under
 #     /usr/share/wireplumber/wireplumber.conf.d/
 #   - the psys source patches, by restoring the oldest backup this pack made
@@ -82,6 +87,31 @@ for r in 99-hm1092-ir-led.rules 99-svp7500-no-autosuspend.rules; do
     if [[ $GO -eq 1 ]]; then rm -f "$f"; did "$f"; else plan "$f"; fi
   else skip "$f"; fi
 done
+
+step "Howdy device_path hook"
+HOOK_SVC=howdy-ir-device-path.service
+HOOK_UNIT=/etc/systemd/system/$HOOK_SVC
+HOOK_DIR=/usr/local/lib/svp7500-camera
+if [[ -f $HOOK_UNIT ]]; then
+  if [[ $GO -eq 1 ]]; then
+    systemctl disable --now "$HOOK_SVC" >/dev/null 2>&1
+    rm -f "$HOOK_UNIT"
+    systemctl daemon-reload >/dev/null 2>&1
+    did "$HOOK_UNIT  (disabled first)"
+  else
+    plan "$HOOK_UNIT  (systemctl disable --now $HOOK_SVC first)"
+  fi
+else skip "$HOOK_UNIT"; fi
+if [[ -d $HOOK_DIR ]]; then
+  if [[ $GO -eq 1 ]]; then rm -rf "$HOOK_DIR"; did "$HOOK_DIR"; else plan "$HOOK_DIR"; fi
+else skip "$HOOK_DIR"; fi
+# Deliberately NOT reverting device_path: this script does not edit Howdy's
+# config (see the header), and blanking it would be a surprise for someone who
+# only wanted the kernel modules gone. Without the hook it is now frozen at
+# whatever this boot resolved, which goes stale on the next reboot.
+if [[ -f /etc/howdy/config.ini ]]; then
+  warn "Howdy's config.ini is left as it is — device_path is now frozen at $(sed -n 's/^device_path[[:space:]]*=[[:space:]]*//p' /etc/howdy/config.ini | head -1) and nothing will update it"
+fi
 
 step "wireplumber drop-ins"
 WPD=/usr/share/wireplumber/wireplumber.conf.d

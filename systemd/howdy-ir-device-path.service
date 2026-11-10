@@ -1,0 +1,32 @@
+[Unit]
+Description=Point Howdy at this boot's HM1092 IR capture node
+Documentation=file:///usr/local/lib/svp7500-camera/howdy-ir-device-path.sh
+# IPU7 capture nodes are numbered in bind order, so Howdy's device_path has to
+# be resolved again on every boot -- see the header of the script.
+#
+# It has to be right BEFORE anything can authenticate a face, which is both the
+# login manager and systemd-user-sessions (the gate for console logins, where
+# pam_howdy is commonly added to /etc/pam.d/login as well). Ordering against
+# units that do not exist on this machine is harmless, so every common display
+# manager is listed rather than detected.
+After=systemd-modules-load.service
+Before=systemd-user-sessions.service
+Before=plasmalogin.service display-manager.service sddm.service gdm.service lightdm.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+# --wait bounds how long boot can be held up. The script polls the media graph
+# and normally resolves on the first pass; the full wait only elapses when the
+# sensor never bound, which is exactly the case where keeping the old node
+# would be dangerous.
+ExecStart=/usr/local/lib/svp7500-camera/howdy-ir-device-path.sh --wait 10
+TimeoutStartSec=40
+# Exit 1 (the IR node could not be resolved, so device_path was set to `none`
+# and face unlock is off) is deliberately NOT mapped to success. A red unit in
+# `systemctl --failed` is the honest signal that face unlock is not available
+# on this boot, and the journal line above it says why. Nothing Requires this
+# unit, so a failure here does not affect the rest of the boot.
+
+[Install]
+WantedBy=multi-user.target

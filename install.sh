@@ -373,7 +373,9 @@ for f in "$HERE/udev/99-hm1092-ir-led.rules" "$HERE/udev/99-svp7500-no-autosuspe
 done
 # Howdy-side payload, checked only when the Howdy phase will run.
 if [[ $DO_HOWDY -eq 1 ]]; then
-  for f in "$HERE/howdy/ir_reader.py" "$HERE/howdy/video_capture.patch"; do
+  for f in "$HERE/howdy/ir_reader.py" "$HERE/howdy/video_capture.patch" \
+           "$HERE/scripts/howdy-ir-device-path.sh" "$HERE/tools/lib-detect.sh" \
+           "$HERE/systemd/howdy-ir-device-path.service"; do
     [[ -f $f ]] || pf_bad "package is missing ${f#"$HERE"/} — this clone/tarball is incomplete, re-download it"
   done
 fi
@@ -1705,8 +1707,94 @@ else
         action "edit $CFG by hand so it contains: ${cfgmiss[*]}"
       fi
     fi
-    warn "set device_path to your IR node: $HERE/tools/find-ir-node.sh"
-    action "set device_path in $CFG using $HERE/tools/find-ir-node.sh (node numbers shuffle between boots)"
+    # device_path used to be left to the user, with a warning that node numbers
+    # shuffle between boots. That is a standing trap: a stale path either names
+    # nothing (face unlock silently stops working) or names a WORKING RGB
+    # capture node, and then `auth sufficient pam_howdy.so` is authenticating
+    # faces off a visible-light camera that a photograph defeats. So resolve it
+    # on every boot, from the sensor's own links in the media graph.
+    HOOK_DIR=/usr/local/lib/svp7500-camera
+    HOOK_SH=$HOOK_DIR/howdy-ir-device-path.sh
+    HOOK_SVC=howdy-ir-device-path.service
+    hook_ok=1
+    if ! command -v systemctl >/dev/null 2>&1; then
+      hook_ok=0
+      warn "systemctl not found — the boot-time device_path hook needs systemd and was NOT installed"
+      action "this machine has no systemd: run $HERE/scripts/howdy-ir-device-path.sh from your own boot scripts, or set device_path by hand after every boot ($HERE/tools/find-ir-node.sh prints it)"
+    else
+      # The script and lib-detect.sh go in together: the script refuses to guess
+      # a node without it, which is the whole reason there is one copy of the
+      # detection logic.
+      run mkdir -p "$HOOK_DIR" || true
+      if ! run install -m 0755 "$HERE/scripts/howdy-ir-device-path.sh" "$HOOK_SH" \
+         || ! run install -m 0644 "$HERE/tools/lib-detect.sh" "$HOOK_DIR/lib-detect.sh" \
+         || ! run install -m 0644 "$HERE/systemd/$HOOK_SVC" "/etc/systemd/system/$HOOK_SVC"; then
+        hook_ok=0
+        HOWDY_FAIL=$((HOWDY_FAIL+1))
+        bad "could not install the boot-time device_path hook into $HOOK_DIR and /etc/systemd/system"
+        action "copy scripts/howdy-ir-device-path.sh + tools/lib-detect.sh to $HOOK_DIR/ and systemd/$HOOK_SVC to /etc/systemd/system/ by hand, then: systemctl enable $HOOK_SVC"
+      elif [[ $DRY_RUN -eq 0 ]] && { [[ ! -x $HOOK_SH ]] || [[ ! -f $HOOK_DIR/lib-detect.sh ]] || [[ ! -f /etc/systemd/system/$HOOK_SVC ]]; }; then
+        hook_ok=0
+        HOWDY_FAIL=$((HOWDY_FAIL+1))
+        bad "the device_path hook did not land: expected an executable $HOOK_SH, $HOOK_DIR/lib-detect.sh and /etc/systemd/system/$HOOK_SVC"
+        action "copy scripts/howdy-ir-device-path.sh + tools/lib-detect.sh to $HOOK_DIR/ and systemd/$HOOK_SVC to /etc/systemd/system/ by hand, then: systemctl enable $HOOK_SVC"
+      else
+        run_quiet systemctl daemon-reload || warn "systemctl daemon-reload failed — systemd has not re-read the unit yet"
+        if ! run_quiet systemctl enable "$HOOK_SVC"; then
+          hook_ok=0
+          HOWDY_FAIL=$((HOWDY_FAIL+1))
+          bad "could not enable $HOOK_SVC — device_path would go stale on the next boot"
+          action "run 'systemctl enable $HOOK_SVC' by hand"
+        elif [[ $DRY_RUN -eq 0 ]] && ! systemctl is-enabled "$HOOK_SVC" >/dev/null 2>&1; then
+          hook_ok=0
+          HOWDY_FAIL=$((HOWDY_FAIL+1))
+          bad "$HOOK_SVC reports as not enabled after 'systemctl enable' — it will not run at boot"
+          action "run 'systemctl enable $HOOK_SVC' by hand and check 'systemctl is-enabled $HOOK_SVC'"
+        else
+          HOWDY_OK=$((HOWDY_OK+1)); ok "installed $HOOK_SH and enabled $HOOK_SVC (resolves device_path every boot)"
+        fi
+      fi
+    fi
+
+    # Run it once now, so a working camera does not have to wait for a reboot
+    # to get a correct device_path.
+    #
+    # This is BEST EFFORT and deliberately outside the exit contract. On a first
+    # install the hm1092 module has only just been built and is not loaded yet
+    # -- that is what the reboot this installer asks for is for -- so there is
+    # no media graph to resolve and the unit enabled above will do it at boot.
+    # Counting that as a failed step would make every honest first install exit
+    # 1, and "did the camera resolve" is a hardware claim this installer does
+    # not make anywhere else (tools/verify.sh is where that question is asked).
+    HOOK_RUN=$HOOK_SH
+    [[ -x $HOOK_SH ]] || HOOK_RUN=$HERE/scripts/howdy-ir-device-path.sh
+    if [[ $DRY_RUN -eq 1 ]]; then
+      plan "would run $HOOK_RUN to set device_path to the detected IR node"
+    else
+      hook_rc=0; "$HOOK_RUN" --config "$CFG" --wait 10 || hook_rc=$?
+      case $hook_rc in
+        0)
+          ok "device_path = $(sed -n 's/^device_path[[:space:]]*=[[:space:]]*//p' "$CFG" | head -1)"
+          ;;
+        1)
+          # The hook has set device_path to `none` rather than leave a path that
+          # may now be the RGB camera. Face unlock is off until the node
+          # resolves, which is the safe direction to be wrong in.
+          warn "the IR capture node cannot be resolved right now, so device_path is 'none' — face unlock is off until it resolves (it is NOT pointed at the RGB camera, which is the dangerous way this fails)"
+          if [[ $hook_ok -eq 1 ]]; then
+            warn "$HOOK_SVC will set it on the next boot — expected before the reboot this install asks for, since the modules it needs are not loaded yet"
+            action "after rebooting: 'systemctl status $HOOK_SVC' shows what it resolved; if device_path is still none, $HERE/tools/verify.sh says why the hm1092 capture node is missing"
+          else
+            action "set device_path in $CFG by hand after every boot using $HERE/tools/find-ir-node.sh — the boot-time hook is not installed on this machine"
+          fi
+          ;;
+        *)
+          HOWDY_FAIL=$((HOWDY_FAIL+1))
+          bad "$HOOK_RUN exited $hook_rc without setting device_path in $CFG"
+          action "run '$HOOK_RUN --config $CFG --dry-run' by hand and fix what it reports"
+          ;;
+      esac
+    fi
     HOWDY_PHASE_DONE=1
   else
     HOWDY_FAIL=$((HOWDY_FAIL+1))
