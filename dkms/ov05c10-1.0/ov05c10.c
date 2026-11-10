@@ -22,6 +22,33 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-fwnode.h>
 
+/*
+ * Exported by intel_cvs. After this sensor starts clocking its CSI-2 lanes the
+ * SVP7500 bridge still has to be told to forward port 0, via
+ * HOST_SET_MIPI_CONFIG (0x0830). Without it VIDIOC_STREAMON fails -EPIPE and
+ * there is no RGB camera at all. hm1092 has done the equivalent for port 2
+ * since the IR work; the RGB half was never wired up.
+ *
+ * cvs_set_rgb_geometry() hands the bridge this board's real frame geometry --
+ * the verbatim Windows payload describes the DA16260's OV08X40 (1928x1088
+ * binned), so on any other RGB sensor the bridge would otherwise expect a
+ * frame that never arrives.
+ *
+ * Weak refs so ov05c10 still loads when intel_cvs is absent; we just will not
+ * configure the bridge.
+ */
+extern int __weak cvs_send_mipi_rgb_config(void);
+extern void __weak cvs_set_rgb_geometry(u16 width, u16 height, u8 fps, u8 lanes);
+
+static bool cvs_mipi_config = true;
+module_param(cvs_mipi_config, bool, 0644);
+MODULE_PARM_DESC(cvs_mipi_config,
+	"Send the intel_cvs HOST_SET_MIPI_CONFIG for port 0 during stream-on (default Y)");
+
+/* Both supported modes are 2-lane RAW10 at 30 fps. */
+#define OV05C10_CVS_LANES	2
+#define OV05C10_CVS_FPS		30
+
 #define OV05C10_REG_CHIP_ID_H	CCI_REG16(0x00)	//P0:0x00[7:0],0x01[7:0]
 #define OV05C10_REG_CHIP_ID_L	CCI_REG16(0x02)	//P0:0x02[7:0],0x03[7:0]
 #define OV05C10_CHIP_ID		0x43055610
@@ -117,7 +144,8 @@ static const struct cci_reg_sequence ov05c10_trigger[] = {
 	{ CCI_REG8(0x01), 0x01 },
 };
 
-static const struct cci_reg_sequence mode_2888_1808_30fps[] = {
+/* Unreferenced while the 2888x1808 mode is delisted above -- kept for revert. */
+static const struct cci_reg_sequence __maybe_unused mode_2888_1808_30fps[] = {
 	{ CCI_REG8(0xfd), 0x00 },
 	{ CCI_REG8(0x20), 0x00 },
 	{ CCI_REG8(0xfd), 0x00 },
@@ -420,20 +448,26 @@ static const struct cci_reg_sequence mode_2800_1576_30fps[] = {
 };
 
 static const struct ov05c10_mode supported_modes[] = {
-	{
-		.width = 2888,
-		.height = 1808,
-		.hts = 1608,
-		.vts_def = 3720,
-		.vts_min = 3720,
-		.code = MEDIA_BUS_FMT_SGRBG10_1X10,
-		.fps = 30,
-		.reg_list = {
-			.num_of_regs = ARRAY_SIZE(mode_2888_1808_30fps),
-			.regs = mode_2888_1808_30fps,
-		},
-		.link_freq_index = 0,
-	},
+	/*
+	 * The 2888x1808 / link_freq_index 0 (900 MHz) mode is NOT listed.
+	 *
+	 * On the Dell Pro 14 Plus PB14250 (Lunar Lake, INTC10DE) it configures
+	 * and starts cleanly -- "stream on CSI2-0 with 2 lanes", the bridge
+	 * acknowledges HOST_SET_MIPI_CONFIG -- and then delivers zero frames,
+	 * with zero sof_event. Measured invariant to link frequency (900 and
+	 * 480 MHz behave identically) and to every 0x830 payload geometry
+	 * (sensor, half, verbatim OV08X40, 30/60 fps, 1 and 2 lanes: all zero
+	 * SOF). The 2800x1576 / index 1 (480 MHz) mode on the same hardware
+	 * captures 20/20 frames with valid pixel data.
+	 *
+	 * Matches the independent report in intel/ipu7-drivers#26, where the
+	 * working configuration on this model is likewise a single
+	 * 2800x1576 @ 480 MHz mode.
+	 *
+	 * Leaving it listed is actively harmful: libcamera picks it as the
+	 * native mode, so every application gets the one mode that cannot
+	 * produce an image. Restore from git if a board turns up that wants it.
+	 */
 	{
 		.width = 2800,
 		.height = 1576,
@@ -683,6 +717,29 @@ static int ov05c10_start_streaming(struct ov05c10 *ov05c10)
 		goto err_rpm_put;
 	}
 
+	/*
+	 * Order matters: the bridge is configured only once the sensor is
+	 * already clocking the lanes, mirroring hm1092_set_stream().
+	 */
+	if (!cvs_mipi_config) {
+		dev_info(&client->dev,
+			 "  cvs_mipi_config=N, port-0 forwarding NOT configured\n");
+	} else if (cvs_send_mipi_rgb_config && cvs_set_rgb_geometry) {
+		int cvs_ret;
+
+		cvs_set_rgb_geometry(ov05c10->cur_mode->width,
+				     ov05c10->cur_mode->height,
+				     OV05C10_CVS_FPS, OV05C10_CVS_LANES);
+		cvs_ret = cvs_send_mipi_rgb_config();
+		dev_info(&client->dev,
+			 "  intel_cvs port-0 mipi config for %ux%u returned %d\n",
+			 ov05c10->cur_mode->width, ov05c10->cur_mode->height,
+			 cvs_ret);
+	} else {
+		dev_warn(&client->dev,
+			 "  intel_cvs symbols unavailable; port-0 forwarding NOT configured\n");
+	}
+
 	return 0;
 
 err_rpm_put:
@@ -849,9 +906,18 @@ static int ov05c10_init_state(struct v4l2_subdev *sd,
 		.which = V4L2_SUBDEV_FORMAT_TRY,
 		.pad = 0,
 		.format = {
+			/*
+			 * Must be the mode that actually streams. With
+			 * 2888x1808 here the default subdev state is the
+			 * delisted mode, so anything that does not set a
+			 * format explicitly gets the one that delivers no
+			 * frames. v4l2_find_nearest_size() would snap it to
+			 * the single listed mode anyway, but being explicit
+			 * keeps the default honest.
+			 */
 			.code = MEDIA_BUS_FMT_SGRBG10_1X10,
-			.width = 2888,
-			.height = 1808,
+			.width = 2800,
+			.height = 1576,
 		},
 	};
 

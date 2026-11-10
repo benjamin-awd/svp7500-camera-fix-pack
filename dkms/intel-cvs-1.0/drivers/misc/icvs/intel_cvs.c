@@ -152,6 +152,42 @@ int cvs_send_mipi_ir_config(void)
 }
 EXPORT_SYMBOL_GPL(cvs_send_mipi_ir_config);
 
+/*
+ * RGB sibling of the above. The payload selector in cvs_write_i2c() keys off
+ * the length: len==1 picks the IR body, len==0 the RGB one. Both bodies have
+ * been in the tree since the Windows captures were decoded, but only the IR
+ * entry point was ever exported, so nothing on the RGB stream-on path could
+ * reach it -- the bridge was never told to forward port 0 and VIDIOC_STREAMON
+ * failed with -EPIPE.
+ *
+ * Call cvs_set_rgb_geometry() first, so the payload describes the frame this
+ * board's sensor actually sends rather than the DA16260's OV08X40.
+ */
+int cvs_send_mipi_rgb_config(void)
+{
+	int ret;
+	u8 state = 0xff;
+
+	if (!cvs || !cvs->dev) {
+		pr_err("intel_cvs: cvs_send_mipi_rgb_config: not initialized\n");
+		return -ENODEV;
+	}
+	/* len=0 selects the RGB (port 0) payload in cvs_write_i2c */
+	ret = cvs_write_i2c(HOST_SET_MIPI_CONFIG, NULL, 0);
+
+	if (cvs_read_i2c(GET_DEVICE_STATE, (char *)&state, sizeof(state)) > 0)
+		dev_info(cvs->dev,
+			 "%s: post-0x830 GET_DEVICE_STATE = 0x%02x\n",
+			 __func__, state);
+	else
+		dev_warn(cvs->dev,
+			 "%s: post-0x830 GET_DEVICE_STATE read failed\n",
+			 __func__);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cvs_send_mipi_rgb_config);
+
 static int cvs_replay_rgb_hello_init(void)
 {
 	struct i2c_client *i2c;

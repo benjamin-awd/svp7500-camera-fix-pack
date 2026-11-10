@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: CC0-1.0
+#
+# libcamera "simple" IPA tuning for the OmniVision OV05C10
+# (Dell Pro 14 Plus PB14250 / Lunar Lake / IPU7).
+#
+# Two corrections, both measured on this hardware.
+#
+# 1. Saturation. The stock fallback (uncalibrated.yaml) ships with the Ccm
+#    algorithm commented out, so raw channel response reaches RGB with only
+#    AWB gains applied -- flat, desaturated colour. Mean chroma spread rises
+#    from 11.9 (no matrix) to 20.2 with this one.
+#
+# 2. Residual green. libcamera cannot build a CameraSensorHelper for this
+#    sensor ("Failed to create camera sensor helper for ov05c10"), so AWB
+#    derives gains from an estimated colour temperature with no calibration
+#    data and under-corrects. The green row is scaled by 0.93 to trim that,
+#    so the G row sums to 0.93 and not 1.0. That is deliberate.
+#
+#    Driving the frame-average green excess to zero wants 0.86, but that
+#    overcorrects: the bright centre turns pink while the edges stay green,
+#    because the error is not uniform across the field. The sensor has colour
+#    shading the simple IPA cannot correct without lens-shading calibration,
+#    so no single matrix neutralises the whole frame. 0.93 is the compromise
+#    that looks right on skin.
+#
+# Saturation here is the base matrix scaled about identity by 1.15. Raising
+# it further buys little: 1.30 adds ~1 point of chroma for the same clipping.
+#
+# Tuned under office fluorescent light. Different lighting may want a
+# different G-row scale; the other two rows should not need to change.
+#
+# Not a colorimetric calibration. For that, Dell ships
+# OV05C10_BBG501N3_LNL.aiqb for Intel's camera HAL (intel/ipu7-drivers#26).
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+  - Awb:
+  - Ccm:
+      ccms:
+        - ct: 6500
+          ccm: [  1.9200, -0.8050, -0.1150,
+                 -0.3209,  1.5717, -0.3209,
+                  0.1150, -0.8050,  1.6900 ]
+  - Adjust:
+  - Agc:
+...

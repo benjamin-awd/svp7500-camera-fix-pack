@@ -43,6 +43,75 @@ static ushort ir_dt;
 module_param(ir_dt, ushort, 0644);
 MODULE_PARM_DESC(ir_dt, "Override MIPI data type in the IR 0x830 (0=verbatim, e.g. 0x2b)");
 
+/*
+ * RGB 0x830 geometry overrides.
+ *
+ * The Windows-verbatim RGB payload was captured on a DA16260 (OV08X40) and
+ * describes fps=60 lanes=2 1928x1088 -- an OV08X40 2x2-binned descriptor
+ * (exactly half of the 3856x2176 that the IR body carries). A board with a
+ * different RGB sensor -- an OV05C10 at 2888x1808, for instance -- transmits a
+ * frame the bridge was never told to expect, so the CSI-2 receiver sees a
+ * clock and never validates a packet. The signature is
+ *
+ *     intel_ipu7_isys: stream on CSI2-0 with 2 lanes
+ *     (zero sof_event, capture times out)
+ *
+ * and it is invariant to V4L2_CID_LINK_FREQ, which is what distinguishes it
+ * from the HM1092 bug.
+ *
+ * Geometry normally comes from the sensor driver via cvs_set_rgb_geometry(),
+ * so this needs no per-board constant and OV08X40 boards keep the verbatim
+ * payload. These params override that, for sweeping values without a rebuild.
+ * 0 = use whatever the caller supplied, or the verbatim byte if it supplied
+ * nothing.
+ */
+static ushort rgb_fps;
+module_param(rgb_fps, ushort, 0644);
+MODULE_PARM_DESC(rgb_fps, "Override fps in the RGB 0x830 (0=caller/verbatim, e.g. 30)");
+static ushort rgb_lanes;
+module_param(rgb_lanes, ushort, 0644);
+MODULE_PARM_DESC(rgb_lanes, "Override lane count in the RGB 0x830 (0=caller/verbatim, e.g. 2)");
+static ushort rgb_width;
+module_param(rgb_width, ushort, 0644);
+MODULE_PARM_DESC(rgb_width, "Override width in the RGB 0x830 (0=caller/verbatim, e.g. 2888)");
+static ushort rgb_height;
+module_param(rgb_height, ushort, 0644);
+MODULE_PARM_DESC(rgb_height, "Override height in the RGB 0x830 (0=caller/verbatim, e.g. 1808)");
+static ushort rgb_vc_count;
+module_param(rgb_vc_count, ushort, 0644);
+MODULE_PARM_DESC(rgb_vc_count, "Override vc_count in the RGB 0x830 (0=verbatim)");
+static ushort rgb_dt;
+module_param(rgb_dt, ushort, 0644);
+MODULE_PARM_DESC(rgb_dt, "Override MIPI data type in the RGB 0x830 (0=verbatim, e.g. 0x2b)");
+static bool rgb_patch_desc2 = true;
+module_param(rgb_patch_desc2, bool, 0644);
+MODULE_PARM_DESC(rgb_patch_desc2,
+	"Also write the width into the second port descriptor at +54/55 (default Y). "
+	"That field is INFERRED from the capture, not confirmed; set N to leave it verbatim.");
+static char *rgb_poke;
+module_param(rgb_poke, charp, 0644);
+MODULE_PARM_DESC(rgb_poke,
+	"Poke arbitrary bytes into the RGB 0x830 body: \"off:val,off:val\" (0x ok). "
+	"Struct begins at +8: fps+8 lanes+9 phy+10 vc_count+11 vc+12 dt_count+13 "
+	"width+14/15 height+16/17 dt+18. Applied after the field overrides.");
+
+/*
+ * Geometry the RGB sensor driver reports for the mode it is about to stream.
+ * Set from ov05c10 (or any other RGB sensor driver) immediately before it asks
+ * for the 0x830, so the bridge is told the frame the sensor actually sends.
+ */
+static u16 rgb_caller_width, rgb_caller_height;
+static u8  rgb_caller_fps, rgb_caller_lanes;
+
+void cvs_set_rgb_geometry(u16 width, u16 height, u8 fps, u8 lanes)
+{
+	rgb_caller_width  = width;
+	rgb_caller_height = height;
+	rgb_caller_fps    = fps;
+	rgb_caller_lanes  = lanes;
+}
+EXPORT_SYMBOL_GPL(cvs_set_rgb_geometry);
+
 int cvs_write_i2c(u16 cmd, u8 *data, u32 len)
 {
 	struct intel_cvs *ctx = cvs;
@@ -277,17 +346,95 @@ int cvs_write_i2c(u16 cmd, u8 *data, u32 len)
 				}
 				payload = ir_patched;
 				payload_label = "IR geometry-override";
+				/*
+				 * Indices must match the writes above: the
+				 * previous version read one byte high in every
+				 * field, so these knobs misreported what they
+				 * had just set.
+				 */
 				dev_info(cvs->dev,
 					 "%s: IRGEOM fps=%u lanes=%u vc=%u %ux%u dt=0x%02x\n",
-					 __func__, ir_patched[9], ir_patched[10],
-					 ir_patched[12],
-					 ir_patched[15] | (ir_patched[16] << 8),
-					 ir_patched[18] | (ir_patched[19] << 8),
-					 ir_patched[20]);
+					 __func__, ir_patched[8], ir_patched[9],
+					 ir_patched[11],
+					 ir_patched[14] | (ir_patched[15] << 8),
+					 ir_patched[16] | (ir_patched[17] << 8),
+					 ir_patched[18]);
 			}
 		} else if (data == NULL || len == 0) {
+			u16 w = rgb_width  ? rgb_width  : rgb_caller_width;
+			u16 h = rgb_height ? rgb_height : rgb_caller_height;
+			u16 f = rgb_fps    ? rgb_fps    : rgb_caller_fps;
+			u16 l = rgb_lanes  ? rgb_lanes  : rgb_caller_lanes;
+
 			payload = windows_0x830_rgb_body;
 			payload_label = "Windows verbatim RGB (port 0)";
+
+			if (w || h || f || l || rgb_vc_count || rgb_dt ||
+			    (rgb_poke && rgb_poke[0])) {
+				static u8 rgb_patched[254];
+
+				memcpy(rgb_patched, windows_0x830_rgb_body, 254);
+				if (f)
+					rgb_patched[8] = f & 0xff;
+				if (l)
+					rgb_patched[9] = l & 0xff;
+				if (rgb_vc_count)
+					rgb_patched[11] = rgb_vc_count & 0xff;
+				if (w) {
+					rgb_patched[14] = w & 0xff;
+					rgb_patched[15] = (w >> 8) & 0xff;
+					/*
+					 * The capture repeats the width in a
+					 * second port descriptor. Inferred,
+					 * not confirmed -- rgb_patch_desc2=N
+					 * leaves it alone.
+					 */
+					if (rgb_patch_desc2) {
+						rgb_patched[54] = w & 0xff;
+						rgb_patched[55] = (w >> 8) & 0xff;
+					}
+				}
+				if (h) {
+					rgb_patched[16] = h & 0xff;
+					rgb_patched[17] = (h >> 8) & 0xff;
+				}
+				if (rgb_dt)
+					rgb_patched[18] = rgb_dt & 0xff;
+				if (rgb_poke && rgb_poke[0]) {
+					const char *p = rgb_poke;
+
+					while (*p) {
+						unsigned int off = 0, val = 0;
+						char *end;
+
+						off = simple_strtoul(p, &end, 0);
+						if (end == p || *end != ':')
+							break;
+						p = end + 1;
+						val = simple_strtoul(p, &end, 0);
+						if (end == p)
+							break;
+						p = end;
+						if (off < 254) {
+							rgb_patched[off] = val & 0xff;
+							dev_info(cvs->dev,
+								 "%s: RGBPOKE [%u]=0x%02x\n",
+								 __func__, off, val & 0xff);
+						}
+						while (*p == ',' || *p == ' ')
+							p++;
+					}
+				}
+				payload = rgb_patched;
+				payload_label = "RGB geometry-override";
+				dev_info(cvs->dev,
+					 "%s: RGBGEOM fps=%u lanes=%u vc=%u %ux%u dt=0x%02x\n",
+					 __func__, rgb_patched[8], rgb_patched[9],
+					 rgb_patched[11],
+					 rgb_patched[14] | (rgb_patched[15] << 8),
+					 rgb_patched[16] | (rgb_patched[17] << 8),
+					 rgb_patched[18]);
+			}
 		} else {
 			payload = NULL;
 			payload_label = "caller SSDB";
