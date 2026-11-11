@@ -112,11 +112,12 @@ IPUVER=0.0.r74         # the ipu7-drivers version DKMS "has installed"
 # that is how "no initramfs generator is installed" becomes a testable state on
 # a laptop that has mkinitcpio.
 # Deliberately short: everything on it is coreutils, util-linux or diffutils on
-# every distro this package targets, and a missing one exits 3 rather than
-# quietly changing what the test means.
+# every distro this package targets, plus python3, which fix-psys-defer.sh
+# needs to patch ipu-psys.c. A missing one exits 3 rather than quietly
+# changing what the test means.
 SYSBIN=(bash sh cat cp mv rm mkdir ls sed awk grep find head tail sort cmp
         chmod install ln touch date stat readlink basename dirname tr od id wc
-        env mktemp true false test printf)
+        env mktemp true false test printf sleep python3)
 
 # ---------------------------------------------------------------------------
 # Scenario table.  name | args to install.sh | one-line statement of the rule
@@ -250,6 +251,10 @@ if [[ ${INNER:-0} -eq 1 ]]; then
   bind_required "$SB/root/lib-modules" /lib/modules
   bind_required "$SB/root/usr-src"     /usr/src
   bind_required "$SB/root/etc-udev"    /etc/udev
+  bind_required "$SB/root/etc-modprobe.d" /etc/modprobe.d
+  # install.sh skips this step when /usr/share/wireplumber does not exist, so
+  # a host without WirePlumber is already contained; one with it is shadowed.
+  bind "$SB/root/usr-share-wireplumber" /usr/share/wireplumber
   bind_required "$SB/root/sys"         /sys
   if [[ ! -d /var/lib/dkms ]]; then
     mount -t tmpfs none /var/lib || die_inner "cannot shadow /var/lib"
@@ -273,7 +278,7 @@ if [[ ${INNER:-0} -eq 1 ]]; then
   # install.sh would write to the real path.
   # /lib is a symlink to usr/lib on Arch-family systems, so mountinfo records
   # the resolved path. Compare what the kernel recorded, not what we typed.
-  for m in /lib/modules /usr/src /etc/udev /sys /var/lib/dkms; do
+  for m in /lib/modules /usr/src /etc/udev /etc/modprobe.d /sys /var/lib/dkms; do
     r=$(readlink -f "$m")
     grep -qE " (${m}|${r}) " /proc/self/mountinfo \
       || die_inner "$m ($r) is not a mountpoint in this namespace"
@@ -770,6 +775,7 @@ fake_sysfs(){ # $1 = sandbox, $2 = supported|unsupported
 build_world(){ # $1 = sandbox dir
   local sb=$1 k
   mkdir -p "$sb/root/lib-modules" "$sb/root/usr-src" "$sb/root/etc-udev/rules.d" \
+           "$sb/root/etc-modprobe.d" "$sb/root/usr-share-wireplumber" \
            "$sb/root/var-lib-dkms" "$sb/root/empty"
 
   cp -a "$ROOT" "$sb/pkg"
@@ -800,18 +806,24 @@ AUTOINSTALL="yes"
 EOF
   cat >"$ipu/drivers/media/pci/intel/ipu7/psys/ipu-psys.c" <<'EOF'
 // SPDX-License-Identifier: GPL-2.0
-/* stand-in for the vendor psys source, carrying the two patterns the fix-pack
-   looks for and nothing else. */
+/* stand-in for the vendor psys source, carrying the patterns the three
+   psys fix scripts (defer, busreg, debugfs) look for and nothing else. */
+static const struct bus_type ipu7_psys_bus = {
+	.name = "intel-ipu7-psys",
+};
+
 static int ipu7_psys_probe(struct auxiliary_device *auxdev,
 			   const struct auxiliary_device_id *id)
 {
-	struct ipu7_device *isp = adev->isp;
-
-	if (!isp->ipu7_bus_ready_to_probe)
+	if (!adev->isp->ipu7_bus_ready_to_probe)
 		return -EPROBE_DEFER;
+
+	psys->debugfsdir = debugfs_create_dir("psys", psys->adev->isp->ipu7_dir);
 
 	return 0;
 }
+
+module_auxiliary_driver(ipu7_psys_driver);
 EOF
   cp "$ipu/drivers/media/pci/intel/ipu7/psys/ipu-psys.c" "$sb/pristine-ipu-psys.c"
 
@@ -1456,9 +1468,11 @@ assert_full_success(){
   if grep -q 'ir_reader' "$SB/howdyroot/recorders/video_capture.py"; then
     pass "video_capture.py really carries the ir hook"
   else fail "video_capture.py has no ir hook"; SC_FAILS=$((SC_FAILS+1)); fi
-  if grep -q 'DKMS struct layout mismatch' \
+  # fix-psys-defer.sh bounds the wait rather than deleting it (c2965db), so
+  # its marker is the deadline variable, not the old "skip defer" comment.
+  if grep -q 'psys_ready_deadline' \
       "$SB/root/usr-src/ipu7-drivers-$IPUVER/drivers/media/pci/intel/ipu7/psys/ipu-psys.c"; then
-    pass "the psys defer check really is neutralised in the vendor tree"
+    pass "the psys defer check really is bounded in the vendor tree"
   else fail "the psys source still has the defer check"; SC_FAILS=$((SC_FAILS+1)); fi
 }
 assert_full_success_rerun(){
