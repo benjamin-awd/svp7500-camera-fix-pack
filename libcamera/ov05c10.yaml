@@ -3,7 +3,7 @@
 # libcamera "simple" IPA tuning for the OmniVision OV05C10
 # (Dell Pro 14 Plus PB14250 / Lunar Lake / IPU7).
 #
-# Two corrections, both measured on this hardware.
+# Three corrections, all measured on this hardware.
 #
 # 1. Saturation. The stock fallback (uncalibrated.yaml) ships with the Ccm
 #    algorithm commented out, so raw channel response reaches RGB with only
@@ -13,18 +13,28 @@
 # 2. Residual green. libcamera cannot build a CameraSensorHelper for this
 #    sensor ("Failed to create camera sensor helper for ov05c10"), so AWB
 #    derives gains from an estimated colour temperature with no calibration
-#    data and under-corrects. The green row is scaled by 0.93 to trim that,
-#    so the G row sums to 0.93 and not 1.0. That is deliberate.
+#    data and under-corrects. The green row is scaled by 0.90 relative to
+#    the other two rows to trim that. That is deliberate.
 #
-#    Driving the frame-average green excess to zero wants 0.86, but that
-#    overcorrects: the bright centre turns pink while the edges stay green,
-#    because the error is not uniform across the field. The sensor has colour
+#    The error is not uniform across the field: the sensor has colour
 #    shading the simple IPA cannot correct without lens-shading calibration,
-#    so no single matrix neutralises the whole frame. 0.93 is the compromise
-#    that looks right on skin.
+#    so no single matrix neutralises the whole frame. Measured on grey wall
+#    pixels, green excess at 0.93 / 0.90 / 0.88 was -0.3 / -1.1 / -2.0 % in
+#    the centre and +4.8 / +3.3 / +2.3 % at the edges. 0.90 keeps a face in
+#    the centre neutral while taking a third off the green at the edges;
+#    0.88 visibly turns the centre pink.
+#
+# 3. Blown highlights. The lens is much brighter in the centre than at the
+#    edges (again, no lens-shading correction), and AGC exposes for the frame
+#    average, so a pale wall behind your head clips to white. AGC meters the
+#    raw image before this matrix, so scaling the whole matrix down darkens
+#    the output without AGC compensating. At 0.85 clipped pixels fell from
+#    12 % of the frame to 0.1 %, for a mean brightness drop of about 7 %.
 #
 # Saturation here is the base matrix scaled about identity by 1.15. Raising
 # it further buys little: 1.30 adds ~1 point of chroma for the same clipping.
+# The whole matrix is then scaled by 0.85 (point 3), so rows sum to 0.85 and
+# the green row to 0.765 (0.85 x 0.90).
 #
 # Tuned under office fluorescent light. Different lighting may want a
 # different G-row scale; the other two rows should not need to change.
@@ -40,9 +50,9 @@ algorithms:
   - Ccm:
       ccms:
         - ct: 6500
-          ccm: [  1.9200, -0.8050, -0.1150,
-                 -0.3209,  1.5717, -0.3209,
-                  0.1150, -0.8050,  1.6900 ]
+          ccm: [  1.6320, -0.6843, -0.0978,
+                 -0.2640,  1.2928, -0.2640,
+                  0.0978, -0.6843,  1.4365 ]
   - Adjust:
   - Agc:
 ...
